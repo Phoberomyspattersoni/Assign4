@@ -1,0 +1,168 @@
+diff --git a/linux-3.18.77/arch/x86/syscalls/syscall_64.tbl b/linux-3.18.77/arch/x86/syscalls/syscall_64.tbl
+index 281150b5..8fd79db3 100644
+--- a/linux-3.18.77/arch/x86/syscalls/syscall_64.tbl
++++ b/linux-3.18.77/arch/x86/syscalls/syscall_64.tbl
+@@ -187,7 +187,7 @@
+ 178	64	query_module
+ 179	common	quotactl		sys_quotactl
+ 180	64	nfsservctl
+-181	common	getpmsg
++181	common	getpmsg			sys_getmemstat
+ 182	common	putpmsg
+ 183	common	afs_syscall
+ 184	common	tuxcall
+diff --git a/linux-3.18.77/include/linux/memstat.h b/linux-3.18.77/include/linux/memstat.h
+new file mode 100644
+index 00000000..82753ae6
+--- /dev/null
++++ b/linux-3.18.77/include/linux/memstat.h
+@@ -0,0 +1,16 @@
++#ifndef _MEM_STAT_H
++#define _MEM_STAT_H
++
++struct memstat {
++	long num_active_pages;
++	long num_inactive_pages;
++	long num_active_referred_pages;
++	long num_inactive_referred_pages;
++	long num_pages_active_to_inactive;
++	long num_pages_evicted_from_inactive;
++};
++
++extern atomic_t active_inactive_move_count;
++extern atomic_t inactive_evict_count;
++
++#endif	/* _MEM_STAT_H */
+diff --git a/linux-3.18.77/include/linux/mm_types.h b/linux-3.18.77/include/linux/mm_types.h
+index 6e0b2866..c90b5b8e 100644
+--- a/linux-3.18.77/include/linux/mm_types.h
++++ b/linux-3.18.77/include/linux/mm_types.h
+@@ -196,6 +196,7 @@ struct page {
+ #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
+ 	int _last_cpupid;
+ #endif
++	atomic_t free_counter;
+ }
+ /*
+  * The struct page can be forced to be double word aligned so that atomic ops
+diff --git a/linux-3.18.77/kernel/sys.c b/linux-3.18.77/kernel/sys.c
+index 1eaa2f0b..cdbefd82 100644
+--- a/linux-3.18.77/kernel/sys.c
++++ b/linux-3.18.77/kernel/sys.c
+@@ -53,6 +53,11 @@
+ #include <linux/uidgid.h>
+ #include <linux/cred.h>
+ 
++#include <linux/memstat.h>
++#include <linux/mmzone.h>
++#include <linux/mm_types.h>
++#include <linux/page-flags.h>
++
+ #include <linux/kmsg_dump.h>
+ /* Move somewhere else to avoid recompiling? */
+ #include <generated/utsrelease.h>
+@@ -2365,4 +2370,74 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
+ 
+ 	return 0;
+ }
++
++SYSCALL_DEFINE1(getmemstat, struct memstat __user *, data) 
++{
++	int errno;
++	struct memstat k_data;	/* Declare and use memstat in kernel memory */
++	enum lru_list lru;
++
++	struct zone *zone;
++	unsigned long flags;
++	struct page *page;
++	
++	if (data == NULL) {
++		errno = -EINVAL;
++		goto out;
++	}
++	/* Clear out kernel memory */
++	memzero_explicit(&k_data, sizeof(k_data));
++	
++	/* Iterate over zones */
++	for_each_zone(zone) {
++		/* Synchronize access to the zone structure */
++		spin_lock_irqsave(&zone->lock, flags);
++		
++		printk("%s\n", zone->name);		
++
++		/* Synchronize access to the LRU lists */		
++		spin_lock_irq(&zone->lru_lock);
++
++		/* Iterate over every evictable LRU list */
++		for_each_evictable_lru(lru) {
++			struct list_head *page_list = &(zone->lruvec.lists[lru]);
++			
++			/* Iterate over pages */
++			list_for_each_entry(page, page_list, lru) {
++				/* Check if LRU list is active or inactive */
++				if(is_active_lru(lru)) {
++					k_data.num_active_pages++;
++					/* Check for reference bit */
++					if(page->flags & (1 << PG_referenced)) {
++						k_data.num_active_referred_pages++;
++					}
++				}
++				else {
++					k_data.num_inactive_pages++;
++					/* Check for reference bit */
++					if(page->flags & (1 << PG_referenced)) {
++						k_data.num_inactive_referred_pages++;						
++					}
++				}
++			}
++		}
++		
++		spin_unlock_irq(&zone->lru_lock);
++
++		spin_unlock_irqrestore(&zone->lock, flags);
++	}
++
++	k_data.num_pages_active_to_inactive = (long)atomic_read(&active_inactive_move_count);
++	k_data.num_pages_evicted_from_inactive = (long)atomic_read(&inactive_evict_count);
++	
++	/* Copy back the data to user space */
++	if (copy_to_user(data, &k_data, sizeof(struct memstat))) {
++		errno = -EFAULT;
++		goto out;
++	}
++	errno = 0;
++out:
++	return errno;
++}
++
+ #endif /* CONFIG_COMPAT */
+diff --git a/linux-3.18.77/mm/vmscan.c b/linux-3.18.77/mm/vmscan.c
+index d48b2821..0f83c88f 100644
+--- a/linux-3.18.77/mm/vmscan.c
++++ b/linux-3.18.77/mm/vmscan.c
+@@ -146,6 +146,9 @@ unsigned long vm_total_pages;
+ static LIST_HEAD(shrinker_list);
+ static DECLARE_RWSEM(shrinker_rwsem);
+ 
++atomic_t active_inactive_move_count;
++atomic_t inactive_evict_count;
++
+ #ifdef CONFIG_MEMCG
+ static bool global_reclaim(struct scan_control *sc)
+ {
+@@ -1606,6 +1609,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
+ 		nr_scanned, nr_reclaimed,
+ 		sc->priority,
+ 		trace_shrink_flags(file));
++	atomic_add(nr_reclaimed, &inactive_evict_count);
+ 	return nr_reclaimed;
+ }
+ 
+@@ -1744,6 +1748,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
+ 		}
+ 
+ 		ClearPageActive(page);	/* we are de-activating */
++		atomic_inc(&active_inactive_move_count);
+ 		list_add(&page->lru, &l_inactive);
+ 	}
+ 
