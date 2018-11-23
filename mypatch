@@ -13,12 +13,16 @@ index 281150b5..8fd79db3 100644
  184	common	tuxcall
 diff --git a/linux-3.18.77/include/linux/memstat.h b/linux-3.18.77/include/linux/memstat.h
 new file mode 100644
-index 00000000..82753ae6
+index 00000000..faa9e707
 --- /dev/null
 +++ b/linux-3.18.77/include/linux/memstat.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,22 @@
 +#ifndef _MEM_STAT_H
 +#define _MEM_STAT_H
++
++#include <linux/mmzone.h>
++#include <linux/mm_types.h>
++#include <linux/page-flags.h>
 +
 +struct memstat {
 +	long num_active_pages;
@@ -32,99 +36,186 @@ index 00000000..82753ae6
 +extern atomic_t active_inactive_move_count;
 +extern atomic_t inactive_evict_count;
 +
++extern void init_periodic_lru_scan(void);
++
 +#endif	/* _MEM_STAT_H */
 diff --git a/linux-3.18.77/include/linux/mm_types.h b/linux-3.18.77/include/linux/mm_types.h
-index 6e0b2866..c90b5b8e 100644
+index 6e0b2866..1c17d4fa 100644
 --- a/linux-3.18.77/include/linux/mm_types.h
 +++ b/linux-3.18.77/include/linux/mm_types.h
 @@ -196,6 +196,7 @@ struct page {
  #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
  	int _last_cpupid;
  #endif
-+	atomic_t free_counter;
++	int free_counter;
  }
  /*
   * The struct page can be forced to be double word aligned so that atomic ops
-diff --git a/linux-3.18.77/kernel/sys.c b/linux-3.18.77/kernel/sys.c
-index 1eaa2f0b..cdbefd82 100644
---- a/linux-3.18.77/kernel/sys.c
-+++ b/linux-3.18.77/kernel/sys.c
-@@ -53,6 +53,11 @@
- #include <linux/uidgid.h>
- #include <linux/cred.h>
+diff --git a/linux-3.18.77/init/main.c b/linux-3.18.77/init/main.c
+index 32940a68..5ff8c5f6 100644
+--- a/linux-3.18.77/init/main.c
++++ b/linux-3.18.77/init/main.c
+@@ -79,6 +79,8 @@
+ #include <linux/random.h>
+ #include <linux/list.h>
  
 +#include <linux/memstat.h>
++
+ #include <asm/io.h>
+ #include <asm/bugs.h>
+ #include <asm/setup.h>
+@@ -679,6 +681,7 @@ asmlinkage __visible void __init start_kernel(void)
+ 
+ 	/* Do the rest non-__init'ed, we're now alive */
+ 	rest_init();
++	init_periodic_lru_scan();
+ }
+ 
+ /* Call all constructor functions linked into the kernel. */
+diff --git a/linux-3.18.77/kernel/Makefile b/linux-3.18.77/kernel/Makefile
+index 17ea6d4a..84542bff 100644
+--- a/linux-3.18.77/kernel/Makefile
++++ b/linux-3.18.77/kernel/Makefile
+@@ -9,7 +9,7 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    extable.o params.o \
+ 	    kthread.o sys_ni.o nsproxy.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+-	    async.o range.o groups.o smpboot.o
++	    async.o range.o groups.o smpboot.o memstat.o
+ 
+ ifdef CONFIG_FUNCTION_TRACER
+ # Do not trace debug files and internal ftrace files
+diff --git a/linux-3.18.77/kernel/memstat.c b/linux-3.18.77/kernel/memstat.c
+new file mode 100644
+index 00000000..2a01f067
+--- /dev/null
++++ b/linux-3.18.77/kernel/memstat.c
+@@ -0,0 +1,134 @@
++#include <linux/kernel.h>
++#include <linux/init.h> 
++#include <linux/syscalls.h>
++#include <linux/hrtimer.h>
++#include <linux/ktime.h>
 +#include <linux/mmzone.h>
 +#include <linux/mm_types.h>
 +#include <linux/page-flags.h>
 +
- #include <linux/kmsg_dump.h>
- /* Move somewhere else to avoid recompiling? */
- #include <generated/utsrelease.h>
-@@ -2365,4 +2370,74 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
- 
- 	return 0;
- }
++#include <linux/memstat.h>
 +
-+SYSCALL_DEFINE1(getmemstat, struct memstat __user *, data) 
++#include <asm/uaccess.h>
++
++#define for_each_frame_page(page)  \
++		
++
++static struct hrtimer hr_timer;
++static ktime_t ktime_period_ns;
++
++//spin_lock_irqsave(&zone->lock, flags);
++//spin_unlock_irqrestore(&zone->lock, flags);
++//__atomic_add_unless(&page->free_counter,
++//	TestClearPageReferenced(page), INT_MAX);
++	
++static void scan_update_free_counter(void) {
++	enum lru_list lru;
++	struct zone *zone;
++	struct page *page;
++	
++	for_each_zone(zone) {
++		for_each_evictable_lru(lru) {
++			spin_lock_irq(&zone->lru_lock);
++			struct list_head *page_list = &(zone->lruvec.lists[lru]);
++			list_for_each_entry(page, page_list, lru) {
++				if (page->free_counter < INT_MAX) {
++					page->free_counter += TestClearPageReferenced(page);
++				}
++			}
++			spin_unlock_irq(&zone->lru_lock);
++		}
++	}
++}
++ 
++enum hrtimer_restart my_hrtimer_callback( struct hrtimer *timer )
++{
++	//printk( "my_hrtimer_callback called (%ld).\n", jiffies );
++	scan_update_free_counter();
++    ktime_t kt_now = hrtimer_cb_get_time(&hr_timer);
++	hrtimer_forward(&hr_timer, kt_now, ktime_period_ns);
++	
++	return HRTIMER_RESTART;
++}
++
++/* Setup high resolution timer for scanning frames every timer interrupt */
++void init_periodic_lru_scan(void) {
++	ktime_period_ns = ktime_set(0, 1E9L / HZ);
++
++	hrtimer_init( &hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL );
++
++	hr_timer.function = &my_hrtimer_callback;
++
++	printk( "Starting timer to fire in (%ld)\n", jiffies );
++
++	hrtimer_start( &hr_timer, ktime_period_ns, HRTIMER_MODE_REL );	
++}
++/*
++static void __exit exit_periodic_lru_scan(void)
++{
++	hrtimer_cancel(&hr_timer);
++}*/
++
++SYSCALL_DEFINE1(getmemstat, struct memstat __user *, data)
 +{
 +	int errno;
 +	struct memstat k_data;	/* Declare and use memstat in kernel memory */
 +	enum lru_list lru;
 +
 +	struct zone *zone;
-+	unsigned long flags;
 +	struct page *page;
-+	
++
 +	if (data == NULL) {
 +		errno = -EINVAL;
 +		goto out;
 +	}
 +	/* Clear out kernel memory */
 +	memzero_explicit(&k_data, sizeof(k_data));
-+	
++
 +	/* Iterate over zones */
 +	for_each_zone(zone) {
 +		/* Synchronize access to the zone structure */
-+		spin_lock_irqsave(&zone->lock, flags);
-+		
-+		printk("%s\n", zone->name);		
-+
-+		/* Synchronize access to the LRU lists */		
-+		spin_lock_irq(&zone->lru_lock);
++	
++		printk("%s\n", zone->name);
 +
 +		/* Iterate over every evictable LRU list */
 +		for_each_evictable_lru(lru) {
++			/* Synchronize access to the LRU lists */
++			spin_lock_irq(&zone->lru_lock);
++
 +			struct list_head *page_list = &(zone->lruvec.lists[lru]);
-+			
 +			/* Iterate over pages */
 +			list_for_each_entry(page, page_list, lru) {
 +				/* Check if LRU list is active or inactive */
++				
 +				if(is_active_lru(lru)) {
 +					k_data.num_active_pages++;
 +					/* Check for reference bit */
-+					if(page->flags & (1 << PG_referenced)) {
++					if(PageReferenced(page)) {
 +						k_data.num_active_referred_pages++;
 +					}
 +				}
 +				else {
 +					k_data.num_inactive_pages++;
 +					/* Check for reference bit */
-+					if(page->flags & (1 << PG_referenced)) {
-+						k_data.num_inactive_referred_pages++;						
++					if(PageReferenced(page)) {
++						k_data.num_inactive_referred_pages++;
 +					}
 +				}
 +			}
++			spin_unlock_irq(&zone->lru_lock);
 +		}
-+		
-+		spin_unlock_irq(&zone->lru_lock);
-+
-+		spin_unlock_irqrestore(&zone->lock, flags);
 +	}
 +
 +	k_data.num_pages_active_to_inactive = (long)atomic_read(&active_inactive_move_count);
 +	k_data.num_pages_evicted_from_inactive = (long)atomic_read(&inactive_evict_count);
-+	
++
 +	/* Copy back the data to user space */
 +	if (copy_to_user(data, &k_data, sizeof(struct memstat))) {
 +		errno = -EFAULT;
@@ -134,10 +225,20 @@ index 1eaa2f0b..cdbefd82 100644
 +out:
 +	return errno;
 +}
-+
- #endif /* CONFIG_COMPAT */
+diff --git a/linux-3.18.77/mm/page_alloc.c b/linux-3.18.77/mm/page_alloc.c
+index fcd8a8ce..e6ff2239 100644
+--- a/linux-3.18.77/mm/page_alloc.c
++++ b/linux-3.18.77/mm/page_alloc.c
+@@ -2870,6 +2870,7 @@ out:
+ 	if (unlikely(!page && read_mems_allowed_retry(cpuset_mems_cookie)))
+ 		goto retry_cpuset;
+ 
++	page->free_counter = 0;
+ 	return page;
+ }
+ EXPORT_SYMBOL(__alloc_pages_nodemask);
 diff --git a/linux-3.18.77/mm/vmscan.c b/linux-3.18.77/mm/vmscan.c
-index d48b2821..0f83c88f 100644
+index d48b2821..db89d0d8 100644
 --- a/linux-3.18.77/mm/vmscan.c
 +++ b/linux-3.18.77/mm/vmscan.c
 @@ -146,6 +146,9 @@ unsigned long vm_total_pages;
@@ -150,7 +251,35 @@ index d48b2821..0f83c88f 100644
  #ifdef CONFIG_MEMCG
  static bool global_reclaim(struct scan_control *sc)
  {
-@@ -1606,6 +1609,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
+@@ -712,6 +715,17 @@ enum page_references {
+ 	PAGEREF_ACTIVATE,
+ };
+ 
++static int counter_based_reference_check(struct page *page) {
++	if (page->free_counter < INT_MAX) {
++		page->free_counter += TestClearPageReferenced(page);
++	}
++	if(page->free_counter == 0)
++		return 0;
++	else
++		page->free_counter--;
++	return 1;
++}
++
+ static enum page_references page_check_references(struct page *page,
+ 						  struct scan_control *sc)
+ {
+@@ -720,7 +734,8 @@ static enum page_references page_check_references(struct page *page,
+ 
+ 	referenced_ptes = page_referenced(page, 1, sc->target_mem_cgroup,
+ 					  &vm_flags);
+-	referenced_page = TestClearPageReferenced(page);
++	//referenced_page = TestClearPageReferenced(page);
++    referenced_page = counter_based_reference_check(page);
+ 
+ 	/*
+ 	 * Mlock lost the isolation race with us.  Let try_to_unmap()
+@@ -1606,6 +1621,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
  		nr_scanned, nr_reclaimed,
  		sc->priority,
  		trace_shrink_flags(file));
@@ -158,9 +287,15 @@ index d48b2821..0f83c88f 100644
  	return nr_reclaimed;
  }
  
-@@ -1744,6 +1748,7 @@ static void shrink_active_list(unsigned long nr_to_scan,
+@@ -1743,7 +1759,13 @@ static void shrink_active_list(unsigned long nr_to_scan,
+ 			}
  		}
  
++		if(counter_based_reference_check(page)) {
++			list_add(&page->lru, &l_active);
++			continue;
++		}
++
  		ClearPageActive(page);	/* we are de-activating */
 +		atomic_inc(&active_inactive_move_count);
  		list_add(&page->lru, &l_inactive);
